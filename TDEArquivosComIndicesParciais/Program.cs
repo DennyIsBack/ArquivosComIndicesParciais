@@ -3,12 +3,20 @@ using System.IO;
 using System.Globalization;
 using System.Text;
 using System.Collections.Generic;
+using System.Diagnostics;
+using System.Collections;
 
 public class Program
 {
+    public static BPlusTree bPlusTreeProdutos;
+    public static HashTable hashTableCategorias;
+
+    // Dicionário para mapear ProductID -> (Categoria, Offset) em memória
+    public static Dictionary<long, (string Categoria, long Offset)> memoryCatalog = new Dictionary<long, (string, long)>();
+
     public static void Main(string[] args)
     {
-        string path = @"C:\\Users\\joaov\\source\\repos\\ArquivosComIndicesParciais\\ArquivosComIndicesParciais\\2019-Nov.csv";
+        string path = @"C:\\Users\\joaov\\source\\repos\\TDEArquivosComIndicesParciais\\TDEArquivosComIndicesParciais\\2019-Nov.csv";
         string produtosBinFilePath = @"..\..\produtos.bin";
         string produtoIndexFilePath = @"..\..\produto_index.idx";
         string acessosBinFilePath = @"..\..\acessos.bin";
@@ -48,10 +56,24 @@ public class Program
 
     public static void CreateBinaryFilesAndIndices(string csvFilePath, string produtosBinFilePath, string produtoIndexFilePath, string acessosBinFilePath, string acessoIndexFilePath)
     {
+        // Medição do tempo de criação dos arquivos binários
+        var swTotal = Stopwatch.StartNew();
         CreateBinaryFiles(csvFilePath, produtosBinFilePath, acessosBinFilePath);
 
+        // Medição do tempo para reconstrução do índice de produtos
+        var swProdIndex = Stopwatch.StartNew();
         ReconstructProdutoDataAndIndex(produtosBinFilePath, produtoIndexFilePath);
+        swProdIndex.Stop();
+        Console.WriteLine($"Tempo para criar índice de produtos (arquivo): {swProdIndex.Elapsed}");
+
+        // Medição do tempo para reconstrução do índice de acessos
+        var swAcessoIndex = Stopwatch.StartNew();
         ReconstructAcessoDataAndIndex(acessosBinFilePath, acessoIndexFilePath);
+        swAcessoIndex.Stop();
+        Console.WriteLine($"Tempo para criar índice de acessos (arquivo): {swAcessoIndex.Elapsed}");
+
+        swTotal.Stop();
+        Console.WriteLine($"Tempo total para criação dos arquivos binários e índices: {swTotal.Elapsed}");
 
         Console.WriteLine("Arquivos binários e índices criados com sucesso. Pressione Enter para continuar.");
         Console.ReadLine();
@@ -234,7 +256,72 @@ public class Program
             reader.Close();
     }
 
+    public static void BPlusReconstructProdutoDataAndIndex(string produtosBinFilePath)
+    {
+        int order = 4;
+        bPlusTreeProdutos = new BPlusTree(order);
+        int hashTableSize = 1009;
+        hashTableCategorias = new HashTable(hashTableSize);
 
+        memoryCatalog.Clear(); // Limpa o catálogo de memória para reconstruir
+
+        var stopwatch = Stopwatch.StartNew();
+        using (var inputFs = new FileStream(produtosBinFilePath, FileMode.Open, FileAccess.Read))
+        {
+            long offset = 0;
+            byte[] record = new byte[Produto.TamanhoRegistro];
+
+            while (inputFs.Position < inputFs.Length)
+            {
+                int bytesRead = inputFs.Read(record, 0, Produto.TamanhoRegistro);
+                if (bytesRead < Produto.TamanhoRegistro)
+                {
+                    Console.WriteLine("Registro incompleto encontrado. Ignorando.");
+                    break;
+                }
+
+                Produto p = Produto.FromBytes(record);
+
+                if (!p.Deleted)
+                {
+                    bPlusTreeProdutos.Insert(p.ProductID, offset);
+                    hashTableCategorias.Insert(p.Categoria, offset);
+
+                    memoryCatalog[p.ProductID] = (p.Categoria, offset);
+                }
+
+                offset += Produto.TamanhoRegistro;
+            }
+        }
+
+        stopwatch.Stop();
+        Console.WriteLine($"Tempo para criar os índices em memória (B+ e Hash): {stopwatch.Elapsed}");
+    }
+
+    public static Produto BPlusBuscarProdutoPorID(string produtosBinFilePath, long productId)
+    {
+        var stopwatch = Stopwatch.StartNew();
+        long? offset = bPlusTreeProdutos.Search(productId);
+        if (offset.HasValue)
+        {
+            using (var dataFs = new FileStream(produtosBinFilePath, FileMode.Open, FileAccess.Read))
+            {
+                dataFs.Seek(offset.Value, SeekOrigin.Begin);
+                byte[] record = new byte[Produto.TamanhoRegistro];
+                dataFs.Read(record, 0, Produto.TamanhoRegistro);
+                Produto p = Produto.FromBytes(record);
+                if (!p.Deleted)
+                {
+                    stopwatch.Stop();
+                    Console.WriteLine($"Tempo para consultar pela B+ tree: {stopwatch.Elapsed}");
+                    return p;
+                }
+            }
+        }
+        stopwatch.Stop();
+        Console.WriteLine($"Tempo para consultar pela B+ tree (não encontrado): {stopwatch.Elapsed}");
+        return null;
+    }
 
     public static int CompareProdutos(byte[] x, byte[] y)
     {
@@ -277,7 +364,6 @@ public class Program
             if (cmp != 0)
                 return cmp;
 
-            // Se os registros são iguais, compara o índice
             return x.SourceIndex.CompareTo(y.SourceIndex);
         }
     }
@@ -312,6 +398,8 @@ public class Program
 
     public static void ReconstructProdutoDataAndIndex(string produtosBinFilePath, string produtoIndexFilePath)
     {
+        var sw = Stopwatch.StartNew();
+
         string tempProdutosBinFilePath = produtosBinFilePath + ".tmp";
         string tempProdutoIndexFilePath = produtoIndexFilePath + ".tmp";
 
@@ -320,7 +408,6 @@ public class Program
         using (var indexFs = new FileStream(tempProdutoIndexFilePath, FileMode.Create, FileAccess.Write))
         using (var indexBw = new BinaryWriter(indexFs))
         {
-            //long offset = 0;
             long newOffset = 0;
 
             byte[] record = new byte[Produto.TamanhoRegistro];
@@ -338,27 +425,22 @@ public class Program
 
                 if (!p.Deleted)
                 {
-                    // Escreve o registro no novo arquivo
                     outputFs.Write(record, 0, Produto.TamanhoRegistro);
-
                     indexBw.Write(p.ProductID);
                     indexBw.Write(newOffset);
-
                     newOffset += Produto.TamanhoRegistro;
                 }
-
-                //offset += Produto.TamanhoRegistro;
             }
         }
 
-        // Substituir os arquivos antigos pelos novos
         File.Delete(produtosBinFilePath);
         File.Move(tempProdutosBinFilePath, produtosBinFilePath);
 
         File.Delete(produtoIndexFilePath);
         File.Move(tempProdutoIndexFilePath, produtoIndexFilePath);
 
-        Console.WriteLine("Reconstrução completa. Arquivos de dados e índice atualizados.");
+        sw.Stop();
+        Console.WriteLine($"Reconstrução completa (produtos). Tempo: {sw.Elapsed}");
     }
 
     public static void ReadProdutosBin(string produtosBinFilePath, string produtoIndexFilePath)
@@ -367,35 +449,75 @@ public class Program
         {
             Console.Clear();
             Console.WriteLine("Menu do Arquivo 'produtos.bin':");
-            Console.WriteLine("1. Consultar por ProductID");
-            Console.WriteLine("2. Ler todo o arquivo");
-            Console.WriteLine("3. Adicionar produto");
-            Console.WriteLine("4. Remover produto");
-            Console.WriteLine("5. Reconstruir índice de produtos");
-            Console.WriteLine("6. Voltar ao menu anterior");
+            Console.WriteLine("1. Consultar por ProductID (via índice)");
+            Console.WriteLine("2. Consultar por ProductID (via B+ tree)");
+            Console.WriteLine("3. Consultar por Categoria (via tabela hash)");
+            Console.WriteLine("4. Ler todo o arquivo");
+            Console.WriteLine("5. Adicionar produto");
+            Console.WriteLine("6. Remover produto");
+            Console.WriteLine("7. Reconstruir índice de produtos");
+            Console.WriteLine("8. Reconstruir BTree+ e tabela hash de produtos");
+            Console.WriteLine("10. Adicionar produto apenas nos índices em memória (B+)");
+            Console.WriteLine("11. Remover produto apenas nos índices em memória (B+)");
+            Console.WriteLine("12. Adicionar produto apenas nos índices em memória (Hash)");
+            Console.WriteLine("13. Remover produto apenas nos índices em memória (Hash)");
+            Console.WriteLine("14. Voltar ao menu anterior");
             Console.Write("Escolha uma opção: ");
 
             string choice = Console.ReadLine();
             switch (choice)
             {
                 case "1":
-                    ConsultarProdutoPorID(produtosBinFilePath, produtoIndexFilePath);
+                    ConsultarProdutoPorIDViaIndice(produtosBinFilePath, produtoIndexFilePath);
                     break;
                 case "2":
-                    LerTodosProdutos(produtosBinFilePath);
+                    ConsultarProdutoPorIDViaBPlusTree(produtosBinFilePath);
                     break;
                 case "3":
-                    AddProduto(produtosBinFilePath, produtoIndexFilePath);
+                    HashConsultarProdutosPorCategoria(produtosBinFilePath);
                     break;
                 case "4":
-                    RemoveProduto(produtosBinFilePath, produtoIndexFilePath);
+                    LerTodosProdutos(produtosBinFilePath);
                     break;
                 case "5":
-                    ReconstructProdutoDataAndIndex(produtosBinFilePath, produtoIndexFilePath);
-                    Console.WriteLine("Índice reconstruído com sucesso. Pressione Enter para continuar.");
-                    Console.ReadLine();
+                    AddProduto(produtosBinFilePath, produtoIndexFilePath);
                     break;
                 case "6":
+                    RemoveProduto(produtosBinFilePath, produtoIndexFilePath);
+                    break;
+                case "7":
+                    {
+                        var sw = Stopwatch.StartNew();
+                        ReconstructProdutoDataAndIndex(produtosBinFilePath, produtoIndexFilePath);
+                        sw.Stop();
+                        Console.WriteLine("Índice reconstruído com sucesso.");
+                        Console.WriteLine($"Tempo: {sw.Elapsed}. Pressione Enter para continuar.");
+                        Console.ReadLine();
+                        break;
+                    }
+                case "8":
+                    {
+                        var sw = Stopwatch.StartNew();
+                        BPlusReconstructProdutoDataAndIndex(produtosBinFilePath);
+                        sw.Stop();
+                        Console.WriteLine("BTree+ e tabela hash reconstruídos com sucesso.");
+                        Console.WriteLine($"Tempo: {sw.Elapsed}. Pressione Enter para continuar.");
+                        Console.ReadLine();
+                        break;
+                    }
+                case "10":
+                    AddProdutoEmMemoriaB();
+                    break;
+                case "11":
+                    RemoveProdutoEmMemoriaB();
+                    break;
+                case "12":
+                    AddProdutoEmMemoriaHash();
+                    break;
+                case "13":
+                    RemoveProdutoEmMemoriaHash();
+                    break;
+                case "14":
                     return;
                 default:
                     Console.WriteLine("Opção inválida. Pressione Enter para continuar.");
@@ -405,13 +527,170 @@ public class Program
         }
     }
 
-    public static void ConsultarProdutoPorID(string produtosBinFilePath, string produtoIndexFilePath)
+    public static void AddProdutoEmMemoriaB()
+    {
+        if (bPlusTreeProdutos == null)
+        {
+            Console.WriteLine("Índices em memória (B+) não criados. Reconstruindo...");
+            string produtosBinFilePath = @"..\..\produtos.bin";
+            BPlusReconstructProdutoDataAndIndex(produtosBinFilePath);
+        }
+
+        Console.Write("Digite o ProductID: ");
+        long productId = long.Parse(Console.ReadLine());
+        Console.Write("Digite o Preço: ");
+        double preco = double.Parse(Console.ReadLine());
+        Console.Write("Digite a Categoria: ");
+        string categoria = Console.ReadLine();
+
+        var sw = Stopwatch.StartNew();
+        long simulatedOffset = -1;
+        bPlusTreeProdutos.Insert(productId, simulatedOffset);
+
+        memoryCatalog[productId] = (categoria, simulatedOffset);
+        sw.Stop();
+
+        Console.WriteLine("Produto adicionado somente na B+ em memória.");
+        Console.WriteLine($"Tempo da inclusão em memória (B+): {sw.Elapsed}");
+        Console.WriteLine("Pressione Enter para continuar.");
+        Console.ReadLine();
+    }
+
+    public static void RemoveProdutoEmMemoriaB()
+    {
+        if (bPlusTreeProdutos == null)
+        {
+            Console.WriteLine("Índices em memória (B+) não criados. Reconstruindo...");
+            string produtosBinFilePath = @"..\..\produtos.bin";
+            BPlusReconstructProdutoDataAndIndex(produtosBinFilePath);
+        }
+
+        Console.Write("Digite o ProductID para remover: ");
+        long productId = long.Parse(Console.ReadLine());
+
+        var sw = Stopwatch.StartNew();
+        long? offset = bPlusTreeProdutos.Search(productId);
+        if (offset.HasValue && memoryCatalog.ContainsKey(productId))
+        {
+            bPlusTreeProdutos.Remove(productId);
+            memoryCatalog.Remove(productId);
+
+            sw.Stop();
+            Console.WriteLine("Produto removido somente da B+ em memória.");
+            Console.WriteLine($"Tempo da remoção em memória (B+): {sw.Elapsed}");
+        }
+        else
+        {
+            sw.Stop();
+            Console.WriteLine("Produto não encontrado na B+ em memória.");
+        }
+
+        Console.WriteLine("Pressione Enter para continuar.");
+        Console.ReadLine();
+    }
+
+    public static void AddProdutoEmMemoriaHash()
+    {
+        if (hashTableCategorias == null)
+        {
+            Console.WriteLine("Índices em memória (Hash) não criados. Reconstruindo...");
+            string produtosBinFilePath = @"..\..\produtos.bin";
+            BPlusReconstructProdutoDataAndIndex(produtosBinFilePath);
+        }
+
+        Console.Write("Digite o ProductID: ");
+        long productId = long.Parse(Console.ReadLine());
+        Console.Write("Digite o Preço: ");
+        double preco = double.Parse(Console.ReadLine());
+        Console.Write("Digite a Categoria: ");
+        string categoria = Console.ReadLine();
+
+        var sw = Stopwatch.StartNew();
+        long simulatedOffset = -1;
+        hashTableCategorias.Insert(categoria, simulatedOffset);
+        memoryCatalog[productId] = (categoria, simulatedOffset);
+        sw.Stop();
+
+        Console.WriteLine("Produto adicionado somente na Hash em memória.");
+        Console.WriteLine($"Tempo da inclusão em memória (Hash): {sw.Elapsed}");
+        Console.WriteLine("Pressione Enter para continuar.");
+        Console.ReadLine();
+    }
+
+    public static void RemoveProdutoEmMemoriaHash()
+    {
+        if (hashTableCategorias == null)
+        {
+            Console.WriteLine("Índices em memória (Hash) não criados. Reconstruindo...");
+            string produtosBinFilePath = @"..\..\produtos.bin";
+            BPlusReconstructProdutoDataAndIndex(produtosBinFilePath);
+        }
+
+        Console.Write("Digite o ProductID para remover da Hash: ");
+        long productId = long.Parse(Console.ReadLine());
+
+        var sw = Stopwatch.StartNew();
+        if (memoryCatalog.ContainsKey(productId))
+        {
+            var (cat, off) = memoryCatalog[productId];
+            hashTableCategorias.Remove(cat, off);
+
+            memoryCatalog.Remove(productId);
+
+            sw.Stop();
+            Console.WriteLine("Produto removido somente da Hash em memória.");
+            Console.WriteLine($"Tempo da remoção em memória (Hash): {sw.Elapsed}");
+        }
+        else
+        {
+            sw.Stop();
+            Console.WriteLine("Produto não encontrado na Hash em memória.");
+        }
+
+        Console.WriteLine("Pressione Enter para continuar.");
+        Console.ReadLine();
+    }
+
+
+    public static void ConsultarProdutoPorIDViaIndice(string produtosBinFilePath, string produtoIndexFilePath)
     {
         Console.Write("Digite o ProductID para consulta: ");
         string input = Console.ReadLine();
         if (long.TryParse(input, out long productId))
         {
+            var sw = Stopwatch.StartNew();
             Produto produto = BuscarProdutoPorID(produtosBinFilePath, produtoIndexFilePath, productId);
+            sw.Stop();
+            if (produto != null)
+            {
+                Console.WriteLine($"ProductID: {produto.ProductID}, Preço: {produto.Preco}, Categoria: {produto.Categoria}");
+            }
+            else
+            {
+                Console.WriteLine("Produto não encontrado.");
+            }
+            Console.WriteLine($"Tempo da consulta via índice de arquivo: {sw.Elapsed}");
+        }
+        else
+        {
+            Console.WriteLine("ProductID inválido.");
+        }
+        Console.WriteLine("Pressione Enter para voltar ao menu anterior.");
+        Console.ReadLine();
+    }
+
+    public static void ConsultarProdutoPorIDViaBPlusTree(string produtosBinFilePath)
+    {
+        if (bPlusTreeProdutos == null)
+        {
+            Console.WriteLine("A B+ tree não foi construída. Reconstruindo...");
+            BPlusReconstructProdutoDataAndIndex(produtosBinFilePath);
+        }
+        Console.Write("Digite o ProductID para consulta: ");
+        string input = Console.ReadLine();
+        if (long.TryParse(input, out long productId))
+        {
+            Produto produto = BPlusBuscarProdutoPorID(produtosBinFilePath, productId);
             if (produto != null)
             {
                 Console.WriteLine($"ProductID: {produto.ProductID}, Preço: {produto.Preco}, Categoria: {produto.Categoria}");
@@ -425,6 +704,54 @@ public class Program
         {
             Console.WriteLine("ProductID inválido.");
         }
+        Console.WriteLine("Pressione Enter para voltar ao menu anterior.");
+        Console.ReadLine();
+    }
+
+
+    public static void HashConsultarProdutosPorCategoria(string produtosBinFilePath)
+    {
+        if (hashTableCategorias == null)
+        {
+            Console.WriteLine("A tabela hash não foi construída. Reconstruindo...");
+            BPlusReconstructProdutoDataAndIndex(produtosBinFilePath);
+        }
+
+        Console.Write("Digite a Categoria para consulta: ");
+        string categoria = Console.ReadLine();
+        var sw = Stopwatch.StartNew();
+        List<long> offsets = hashTableCategorias.Search(categoria);
+        sw.Stop();
+
+        if (offsets.Count > 0)
+        {
+            using (var dataFs = new FileStream(produtosBinFilePath, FileMode.Open, FileAccess.Read))
+            {
+                // Limita a iteração para as primeiras 5 ocorrências
+                foreach (long offset in offsets.Take(5))
+                {
+                    dataFs.Seek(offset, SeekOrigin.Begin);
+                    byte[] record = new byte[Produto.TamanhoRegistro];
+                    dataFs.Read(record, 0, Produto.TamanhoRegistro);
+                    Produto p = Produto.FromBytes(record);
+                    if (!p.Deleted)
+                    {
+                        Console.WriteLine($"ProductID: {p.ProductID}, Preço: {p.Preco}, Categoria: {p.Categoria}");
+                    }
+                }
+
+                // Verifica se há mais de 5 ocorrências 
+                if (offsets.Count > 5)
+                {
+                    Console.WriteLine($"Foram exibidas as primeiras 5 ocorrências de '{categoria}'.");
+                }
+            }
+        }
+        else
+        {
+            Console.WriteLine("Nenhum produto encontrado para a categoria informada.");
+        }
+        Console.WriteLine($"Tempo da consulta via hash em memória: {sw.Elapsed}");
         Console.WriteLine("Pressione Enter para voltar ao menu anterior.");
         Console.ReadLine();
     }
@@ -474,6 +801,7 @@ public class Program
 
     public static void LerTodosProdutos(string produtosBinFilePath)
     {
+        var sw = Stopwatch.StartNew();
         using (var fs = new FileStream(produtosBinFilePath, FileMode.Open, FileAccess.Read))
         using (var br = new BinaryReader(fs))
         {
@@ -493,6 +821,8 @@ public class Program
                 }
             }
         }
+        sw.Stop();
+        Console.WriteLine($"Tempo para ler todo o arquivo: {sw.Elapsed}");
         Console.WriteLine("Pressione Enter para voltar ao menu anterior.");
         Console.ReadLine();
     }
@@ -513,6 +843,8 @@ public class Program
             Categoria = categoria,
             Deleted = false
         };
+
+        var sw = Stopwatch.StartNew();
 
         long offset;
         using (var fs = new FileStream(produtosBinFilePath, FileMode.Append, FileAccess.Write))
@@ -537,7 +869,6 @@ public class Program
 
                 if (!inserted && productId < currentProductId)
                 {
-                    // Insere o novo registro
                     outputBw.Write(productId);
                     outputBw.Write(offset);
                     inserted = true;
@@ -546,7 +877,6 @@ public class Program
                 if (currentProductId == productId)
                 {
                     Console.WriteLine("ProductID já existe. Operação abortada.");
-                    // Remove o arquivo temporário e retorna
                     outputBw.Close();
                     outputFs.Close();
                     File.Delete(tempIndexFilePath);
@@ -559,17 +889,94 @@ public class Program
 
             if (!inserted)
             {
-                // Insere no final
                 outputBw.Write(productId);
                 outputBw.Write(offset);
             }
         }
 
-        // Substitui o arquivo de índice antigo pelo novo
         File.Delete(produtoIndexFilePath);
         File.Move(tempIndexFilePath, produtoIndexFilePath);
 
+        if (bPlusTreeProdutos != null)
+            bPlusTreeProdutos.Insert(p.ProductID, offset);
+
+        if (hashTableCategorias != null)
+            hashTableCategorias.Insert(p.Categoria, offset);
+
+        sw.Stop();
         Console.WriteLine("Produto adicionado com sucesso!");
+        Console.WriteLine($"Tempo da inclusão: {sw.Elapsed}");
+        Console.WriteLine("Pressione Enter para continuar.");
+        Console.ReadLine();
+    }
+
+    public static void RemoveProduto(string produtosBinFilePath, string produtoIndexFilePath)
+    {
+        Console.Write("Digite o ProductID para remover: ");
+        long productId = long.Parse(Console.ReadLine());
+        var sw = Stopwatch.StartNew();
+
+        string tempIndexFilePath = produtoIndexFilePath + ".tmp";
+        bool found = false;
+        long offsetToDelete = -1;
+
+        using (var inputFs = new FileStream(produtoIndexFilePath, FileMode.Open, FileAccess.Read))
+        using (var inputBr = new BinaryReader(inputFs))
+        using (var outputFs = new FileStream(tempIndexFilePath, FileMode.Create, FileAccess.Write))
+        using (var outputBw = new BinaryWriter(outputFs))
+        {
+            while (inputFs.Position < inputFs.Length)
+            {
+                long currentProductId = inputBr.ReadInt64();
+                long currentOffset = inputBr.ReadInt64();
+
+                if (currentProductId == productId)
+                {
+                    found = true;
+                    offsetToDelete = currentOffset;
+                }
+                else
+                {
+                    outputBw.Write(currentProductId);
+                    outputBw.Write(currentOffset);
+                }
+            }
+        }
+
+        if (found)
+        {
+            using (var fs = new FileStream(produtosBinFilePath, FileMode.Open, FileAccess.Write))
+            {
+                fs.Seek(offsetToDelete + Produto.TamanhoRegistro - 1, SeekOrigin.Begin);
+                fs.WriteByte(1);
+            }
+
+            if (bPlusTreeProdutos != null)
+                bPlusTreeProdutos.Remove(productId);
+
+            using (var fs = new FileStream(produtosBinFilePath, FileMode.Open, FileAccess.Read))
+            {
+                fs.Seek(offsetToDelete, SeekOrigin.Begin);
+                byte[] record = new byte[Produto.TamanhoRegistro];
+                fs.Read(record, 0, Produto.TamanhoRegistro);
+                Produto p = Produto.FromBytes(record);
+                if (hashTableCategorias != null)
+                    hashTableCategorias.Remove(p.Categoria, offsetToDelete);
+            }
+
+            File.Delete(produtoIndexFilePath);
+            File.Move(tempIndexFilePath, produtoIndexFilePath);
+
+            sw.Stop();
+            Console.WriteLine("Produto removido com sucesso!");
+            Console.WriteLine($"Tempo da remoção: {sw.Elapsed}");
+        }
+        else
+        {
+            File.Delete(tempIndexFilePath);
+            Console.WriteLine("Produto não encontrado.");
+        }
+
         Console.WriteLine("Pressione Enter para continuar.");
         Console.ReadLine();
     }
@@ -599,6 +1006,7 @@ public class Program
             Deleted = false
         };
 
+        var sw = Stopwatch.StartNew();
         long offset;
         using (var fs = new FileStream(acessosBinFilePath, FileMode.Append, FileAccess.Write))
         {
@@ -622,7 +1030,6 @@ public class Program
 
                 if (!inserted && userId <= currentUserId)
                 {
-                    // Insere o novo
                     outputBw.Write(userId);
                     outputBw.Write(offset);
                     inserted = true;
@@ -634,7 +1041,6 @@ public class Program
 
             if (!inserted)
             {
-                // Insere no final
                 outputBw.Write(userId);
                 outputBw.Write(offset);
             }
@@ -642,68 +1048,9 @@ public class Program
 
         File.Delete(acessoIndexFilePath);
         File.Move(tempIndexFilePath, acessoIndexFilePath);
-
+        sw.Stop();
         Console.WriteLine("Acesso adicionado com sucesso!");
-        Console.WriteLine("Pressione Enter para continuar.");
-        Console.ReadLine();
-    }
-
-
-    public static void RemoveProduto(string produtosBinFilePath, string produtoIndexFilePath)
-    {
-        Console.Write("Digite o ProductID para remover: ");
-        long productId = long.Parse(Console.ReadLine());
-
-        string tempIndexFilePath = produtoIndexFilePath + ".tmp";
-        bool found = false;
-        long offsetToDelete = -1;
-
-        using (var inputFs = new FileStream(produtoIndexFilePath, FileMode.Open, FileAccess.Read))
-        using (var inputBr = new BinaryReader(inputFs))
-        using (var outputFs = new FileStream(tempIndexFilePath, FileMode.Create, FileAccess.Write))
-        using (var outputBw = new BinaryWriter(outputFs))
-        {
-            while (inputFs.Position < inputFs.Length)
-            {
-                long currentProductId = inputBr.ReadInt64();
-                long currentOffset = inputBr.ReadInt64();
-
-                if (currentProductId == productId)
-                {
-                    found = true;
-                    offsetToDelete = currentOffset;
-                    // Não escreve o registro no novo índice
-                }
-                else
-                {
-                    outputBw.Write(currentProductId);
-                    outputBw.Write(currentOffset);
-                }
-            }
-        }
-
-        if (found)
-        {
-            // Marca como deletado no arquivo de dados
-            using (var fs = new FileStream(produtosBinFilePath, FileMode.Open, FileAccess.Write))
-            {
-                fs.Seek(offsetToDelete + Produto.TamanhoRegistro - 1, SeekOrigin.Begin);
-                fs.WriteByte(1); // true
-            }
-
-            // Substitui o arquivo de índice antigo pelo novo
-            File.Delete(produtoIndexFilePath);
-            File.Move(tempIndexFilePath, produtoIndexFilePath);
-
-            Console.WriteLine("Produto removido com sucesso!");
-        }
-        else
-        {
-            // Remove o arquivo temporário se o produto não foi encontrado
-            File.Delete(tempIndexFilePath);
-            Console.WriteLine("Produto não encontrado.");
-        }
-
+        Console.WriteLine($"Tempo da inclusão: {sw.Elapsed}");
         Console.WriteLine("Pressione Enter para continuar.");
         Console.ReadLine();
     }
@@ -731,6 +1078,7 @@ public class Program
             return;
         }
 
+        var sw = Stopwatch.StartNew();
         bool found = false;
         long offsetToDelete = -1;
         string tempIndexFilePath = acessoIndexFilePath + ".tmp";
@@ -756,10 +1104,9 @@ public class Program
 
                         if (!a.Deleted && a.EventType == eventType && a.EventTime == eventTime)
                         {
-                            // Encontrou
                             found = true;
                             offsetToDelete = currentOffset;
-                            continue; // Não escrever esta entrada no novo índice
+                            continue;
                         }
                     }
                 }
@@ -774,18 +1121,18 @@ public class Program
             using (var fs = new FileStream(acessosBinFilePath, FileMode.Open, FileAccess.Write))
             {
                 fs.Seek(offsetToDelete + Acesso.TamanhoRegistro - 1, SeekOrigin.Begin);
-                fs.WriteByte(1); // true
+                fs.WriteByte(1); // marca deletado
             }
 
-            // Substitui o arquivo de índice antigo pelo novo
             File.Delete(acessoIndexFilePath);
             File.Move(tempIndexFilePath, acessoIndexFilePath);
 
+            sw.Stop();
             Console.WriteLine("Acesso removido com sucesso!");
+            Console.WriteLine($"Tempo da remoção: {sw.Elapsed}");
         }
         else
         {
-            // Remove o arquivo temporário se o acesso não foi encontrado
             File.Delete(tempIndexFilePath);
             Console.WriteLine("Acesso não encontrado.");
         }
@@ -796,6 +1143,7 @@ public class Program
 
     public static void ReconstructAcessoDataAndIndex(string acessosBinFilePath, string acessoIndexFilePath)
     {
+        var sw = Stopwatch.StartNew();
         string tempAcessosBinFilePath = acessosBinFilePath + ".tmp";
         string tempAcessoIndexFilePath = acessoIndexFilePath + ".tmp";
 
@@ -804,7 +1152,6 @@ public class Program
         using (var indexFs = new FileStream(tempAcessoIndexFilePath, FileMode.Create, FileAccess.Write))
         using (var indexBw = new BinaryWriter(indexFs))
         {
-            long offset = 0;
             long newOffset = 0;
 
             byte[] record = new byte[Acesso.TamanhoRegistro];
@@ -822,31 +1169,24 @@ public class Program
 
                 if (!a.Deleted)
                 {
-                    // Escreve o registro no novo arquivo de dados
                     outputFs.Write(record, 0, Acesso.TamanhoRegistro);
-
-                    // Escreve no índice com o novo deslocamento
                     indexBw.Write(a.UserID);
                     indexBw.Write(newOffset);
-
                     newOffset += Acesso.TamanhoRegistro;
                 }
-
-                offset += Acesso.TamanhoRegistro;
             }
         }
 
-        // Substituir os arquivos antigos pelos novos
         File.Delete(acessosBinFilePath);
         File.Move(tempAcessosBinFilePath, acessosBinFilePath);
 
         File.Delete(acessoIndexFilePath);
         File.Move(tempAcessoIndexFilePath, acessoIndexFilePath);
 
-        Console.WriteLine("Reconstrução completa. Arquivos de dados e índice atualizados.");
+        sw.Stop();
+        Console.WriteLine("Reconstrução completa (acessos).");
+        Console.WriteLine($"Tempo: {sw.Elapsed}");
     }
-
-
 
     public static void ReadAcessosBin(string acessosBinFilePath, string acessoIndexFilePath)
     {
@@ -878,10 +1218,14 @@ public class Program
                     RemoveAcesso(acessosBinFilePath, acessoIndexFilePath);
                     break;
                 case "5":
-                    ReconstructAcessoDataAndIndex(acessosBinFilePath, acessoIndexFilePath);
-                    Console.WriteLine("Índice reconstruído com sucesso. Pressione Enter para continuar.");
-                    Console.ReadLine();
-                    break;
+                    {
+                        var sw = Stopwatch.StartNew();
+                        ReconstructAcessoDataAndIndex(acessosBinFilePath, acessoIndexFilePath);
+                        sw.Stop();
+                        Console.WriteLine($"Índice reconstruído com sucesso. Tempo: {sw.Elapsed}. Pressione Enter para continuar.");
+                        Console.ReadLine();
+                        break;
+                    }
                 case "6":
                     return;
                 default:
@@ -898,7 +1242,9 @@ public class Program
         string input = Console.ReadLine();
         if (long.TryParse(input, out long userId))
         {
+            var sw = Stopwatch.StartNew();
             List<Acesso> acessos = BuscarAcessosPorUserID(acessosBinFilePath, acessoIndexFilePath, userId);
+            sw.Stop();
             if (acessos.Count > 0)
             {
                 foreach (var a in acessos)
@@ -910,6 +1256,7 @@ public class Program
             {
                 Console.WriteLine("Nenhum acesso encontrado para o UserID informado.");
             }
+            Console.WriteLine($"Tempo da consulta via índice de arquivo: {sw.Elapsed}");
         }
         else
         {
@@ -925,20 +1272,17 @@ public class Program
 
         List<AcessoIndexEntry> indexEntries = LoadAcessoIndex(acessoIndexFilePath);
 
-        // Encontrar as entradas com o UserID
         int index = indexEntries.BinarySearch(new AcessoIndexEntry { UserID = userId }, Comparer<AcessoIndexEntry>.Create((a, b) => a.UserID.CompareTo(b.UserID)));
 
         if (index < 0)
             index = ~index;
 
-        // Deixa na posição correta no arquivo de index
         int startIndex = index;
-        while (startIndex > 0 && indexEntries[startIndex - 1].UserID == userId)
+        while (startIndex > 0 && startIndex < indexEntries.Count && indexEntries[startIndex - 1].UserID == userId)
         {
             startIndex--;
         }
 
-        // Percorrer para frente para coletar todos os acessos
         for (int i = startIndex; i < indexEntries.Count && indexEntries[i].UserID == userId; i++)
         {
             long offset = indexEntries[i].Offset;
@@ -959,6 +1303,7 @@ public class Program
 
     public static void LerTodosAcessos(string acessosBinFilePath)
     {
+        var sw = Stopwatch.StartNew();
         using (var fs = new FileStream(acessosBinFilePath, FileMode.Open, FileAccess.Read))
         using (var br = new BinaryReader(fs))
         {
@@ -978,6 +1323,8 @@ public class Program
                 }
             }
         }
+        sw.Stop();
+        Console.WriteLine($"Tempo para ler todo o arquivo de acessos: {sw.Elapsed}");
         Console.WriteLine("Pressione Enter para voltar ao menu anterior.");
         Console.ReadLine();
     }
@@ -1017,12 +1364,10 @@ public class Produto : IByteSerializable
             bw.Write(ProductID);
             bw.Write(Preco);
 
-            // Ajustar a string para ter tamanho fixo
             string categoriaAjustada = (Categoria ?? string.Empty).PadRight(100).Substring(0, 100);
             bw.Write(Encoding.ASCII.GetBytes(categoriaAjustada));
 
-            bw.Write(Deleted ? (byte)1 : (byte)0); // Escrever o campo Deleted
-
+            bw.Write(Deleted ? (byte)1 : (byte)0);
             return ms.ToArray();
         }
     }
@@ -1042,10 +1387,411 @@ public class Produto : IByteSerializable
             byte[] categoriaBytes = br.ReadBytes(100);
             p.Categoria = Encoding.ASCII.GetString(categoriaBytes).TrimEnd();
 
-            p.Deleted = br.ReadByte() == 1; // Le o campo Deleted
-
+            p.Deleted = br.ReadByte() == 1;
             return p;
         }
+    }
+}
+
+public class BPlusTreeNode
+{
+    public bool IsLeaf { get; set; }
+    public List<long> Keys { get; set; }
+    public List<long> Offsets { get; set; }
+    public List<BPlusTreeNode> Children { get; set; }
+    public BPlusTreeNode Next { get; set; }
+
+    public BPlusTreeNode(bool isLeaf)
+    {
+        IsLeaf = isLeaf;
+        Keys = new List<long>();
+        if (IsLeaf)
+        {
+            Offsets = new List<long>();
+            Children = null;
+            Next = null;
+        }
+        else
+        {
+            Offsets = null;
+            Children = new List<BPlusTreeNode>();
+            Next = null;
+        }
+    }
+}
+
+public class BPlusTree
+{
+    private int Order;
+    private BPlusTreeNode Root;
+
+    public BPlusTree(int order)
+    {
+        Order = order;
+        Root = new BPlusTreeNode(true);
+    }
+
+    public void Insert(long key, long offset)
+    {
+        BPlusTreeNode root = Root;
+        if (root.Keys.Count == 2 * Order - 1)
+        {
+            BPlusTreeNode newRoot = new BPlusTreeNode(false);
+            newRoot.Children.Add(root);
+            SplitChild(newRoot, 0);
+            Root = newRoot;
+            InsertNonFull(newRoot, key, offset);
+        }
+        else
+        {
+            InsertNonFull(root, key, offset);
+        }
+    }
+
+    private void InsertNonFull(BPlusTreeNode node, long key, long offset)
+    {
+        int i = node.Keys.Count - 1;
+        if (node.IsLeaf)
+        {
+            while (i >= 0 && key < node.Keys[i])
+            {
+                i--;
+            }
+            node.Keys.Insert(i + 1, key);
+            node.Offsets.Insert(i + 1, offset);
+        }
+        else
+        {
+            while (i >= 0 && key < node.Keys[i])
+            {
+                i--;
+            }
+            i++;
+            if (node.Children[i].Keys.Count == 2 * Order - 1)
+            {
+                SplitChild(node, i);
+                if (key > node.Keys[i])
+                {
+                    i++;
+                }
+            }
+            InsertNonFull(node.Children[i], key, offset);
+        }
+    }
+
+    private void SplitChild(BPlusTreeNode parent, int index)
+    {
+        BPlusTreeNode nodeToSplit = parent.Children[index];
+        BPlusTreeNode newNode = new BPlusTreeNode(nodeToSplit.IsLeaf);
+
+        int t = Order;
+
+        newNode.Keys.AddRange(nodeToSplit.Keys.GetRange(t, t - 1));
+        nodeToSplit.Keys.RemoveRange(t, t - 1);
+
+        if (nodeToSplit.IsLeaf)
+        {
+            newNode.Offsets.AddRange(nodeToSplit.Offsets.GetRange(t, t - 1));
+            nodeToSplit.Offsets.RemoveRange(t, t - 1);
+
+            newNode.Next = nodeToSplit.Next;
+            nodeToSplit.Next = newNode;
+        }
+        else
+        {
+            newNode.Children.AddRange(nodeToSplit.Children.GetRange(t, t));
+            nodeToSplit.Children.RemoveRange(t, t);
+        }
+
+        parent.Keys.Insert(index, nodeToSplit.Keys[t - 1]);
+        nodeToSplit.Keys.RemoveAt(t - 1);
+        parent.Children.Insert(index + 1, newNode);
+    }
+
+    public long? Search(long key)
+    {
+        return Search(Root, key);
+    }
+
+    private long? Search(BPlusTreeNode node, long key)
+    {
+        int i = 0;
+        while (i < node.Keys.Count && key > node.Keys[i])
+        {
+            i++;
+        }
+
+        if (node.IsLeaf)
+        {
+            if (i < node.Keys.Count && node.Keys[i] == key)
+            {
+                return node.Offsets[i];
+            }
+            else
+            {
+                return null;
+            }
+        }
+        else
+        {
+            return Search(node.Children[i], key);
+        }
+    }
+
+    public void Remove(long key)
+    {
+        Remove(Root, key);
+        if (Root.Keys.Count == 0 && !Root.IsLeaf)
+        {
+            Root = Root.Children[0];
+        }
+    }
+
+    private void Remove(BPlusTreeNode node, long key)
+    {
+        int idx = node.Keys.FindIndex(k => k == key);
+        if (node.IsLeaf)
+        {
+            if (idx != -1)
+            {
+                node.Keys.RemoveAt(idx);
+                node.Offsets.RemoveAt(idx);
+
+                if (node != Root && node.Keys.Count < Order - 1)
+                {
+                    Rebalance(node);
+                }
+            }
+            else
+            {
+                Console.WriteLine("Chave não encontrada.");
+            }
+        }
+        else
+        {
+            int childIdx = 0;
+            while (childIdx < node.Keys.Count && key > node.Keys[childIdx])
+            {
+                childIdx++;
+            }
+
+            Remove(node.Children[childIdx], key);
+
+            if (node.Children[childIdx].Keys.Count < Order - 1)
+            {
+                RebalanceChild(node, childIdx);
+            }
+        }
+    }
+
+    private void Rebalance(BPlusTreeNode node)
+    {
+        BPlusTreeNode parent = FindParent(Root, node);
+        if (parent == null) return;
+
+        int idx = parent.Children.IndexOf(node);
+
+        BPlusTreeNode leftSibling = idx > 0 ? parent.Children[idx - 1] : null;
+        BPlusTreeNode rightSibling = idx < parent.Children.Count - 1 ? parent.Children[idx + 1] : null;
+
+        if (leftSibling != null && leftSibling.Keys.Count > Order - 1)
+        {
+            node.Keys.Insert(0, leftSibling.Keys.Last());
+            node.Offsets.Insert(0, leftSibling.Offsets.Last());
+            leftSibling.Keys.RemoveAt(leftSibling.Keys.Count - 1);
+            leftSibling.Offsets.RemoveAt(leftSibling.Offsets.Count - 1);
+
+            parent.Keys[idx - 1] = node.Keys.First();
+        }
+        else if (rightSibling != null && rightSibling.Keys.Count > Order - 1)
+        {
+            node.Keys.Add(rightSibling.Keys.First());
+            node.Offsets.Add(rightSibling.Offsets.First());
+            rightSibling.Keys.RemoveAt(0);
+            rightSibling.Offsets.RemoveAt(0);
+
+            parent.Keys[idx] = rightSibling.Keys.First();
+        }
+        else
+        {
+            if (leftSibling != null)
+            {
+                leftSibling.Keys.AddRange(node.Keys);
+                leftSibling.Offsets.AddRange(node.Offsets);
+                leftSibling.Next = node.Next;
+
+                parent.Keys.RemoveAt(idx - 1);
+                parent.Children.RemoveAt(idx);
+            }
+            else if (rightSibling != null)
+            {
+                node.Keys.AddRange(rightSibling.Keys);
+                node.Offsets.AddRange(rightSibling.Offsets);
+                node.Next = rightSibling.Next;
+
+                parent.Keys.RemoveAt(idx);
+                parent.Children.RemoveAt(idx + 1);
+            }
+
+            if (parent == Root && parent.Keys.Count == 0)
+            {
+                Root = node;
+            }
+        }
+    }
+
+    private void RebalanceChild(BPlusTreeNode parent, int idx)
+    {
+        BPlusTreeNode node = parent.Children[idx];
+        BPlusTreeNode leftSibling = idx > 0 ? parent.Children[idx - 1] : null;
+        BPlusTreeNode rightSibling = idx < parent.Children.Count - 1 ? parent.Children[idx + 1] : null;
+
+        if (leftSibling != null && leftSibling.Keys.Count > Order - 1)
+        {
+            node.Keys.Insert(0, parent.Keys[idx - 1]);
+            parent.Keys[idx - 1] = leftSibling.Keys.Last();
+            if (!node.IsLeaf)
+            {
+                node.Children.Insert(0, leftSibling.Children.Last());
+                leftSibling.Children.RemoveAt(leftSibling.Children.Count - 1);
+            }
+            leftSibling.Keys.RemoveAt(leftSibling.Keys.Count - 1);
+        }
+        else if (rightSibling != null && rightSibling.Keys.Count > Order - 1)
+        {
+            node.Keys.Add(parent.Keys[idx]);
+            parent.Keys[idx] = rightSibling.Keys.First();
+            if (!node.IsLeaf)
+            {
+                node.Children.Add(rightSibling.Children.First());
+                rightSibling.Children.RemoveAt(0);
+            }
+            rightSibling.Keys.RemoveAt(0);
+        }
+        else
+        {
+            if (leftSibling != null)
+            {
+                leftSibling.Keys.Add(parent.Keys[idx - 1]);
+                leftSibling.Keys.AddRange(node.Keys);
+                if (!node.IsLeaf)
+                {
+                    leftSibling.Children.AddRange(node.Children);
+                }
+
+                parent.Keys.RemoveAt(idx - 1);
+                parent.Children.RemoveAt(idx);
+            }
+            else if (rightSibling != null)
+            {
+                node.Keys.Add(parent.Keys[idx]);
+                node.Keys.AddRange(rightSibling.Keys);
+                if (!node.IsLeaf)
+                {
+                    node.Children.AddRange(rightSibling.Children);
+                }
+
+                parent.Keys.RemoveAt(idx);
+                parent.Children.RemoveAt(idx + 1);
+            }
+
+            if (parent == Root && parent.Keys.Count == 0)
+            {
+                Root = node;
+            }
+        }
+    }
+
+    private BPlusTreeNode FindParent(BPlusTreeNode current, BPlusTreeNode child)
+    {
+        if (current.IsLeaf || current.Children == null)
+            return null;
+
+        foreach (var c in current.Children)
+        {
+            if (c == child)
+                return current;
+            else
+            {
+                var result = FindParent(c, child);
+                if (result != null)
+                    return result;
+            }
+        }
+        return null;
+    }
+}
+
+public class HashEntry
+{
+    public string Key { get; set; }
+    public List<long> Offsets { get; set; }
+
+    public HashEntry(string key)
+    {
+        Key = key;
+        Offsets = new List<long>();
+    }
+}
+
+public class HashTable
+{
+    private int Size;
+    private List<HashEntry>[] Table;
+
+    public HashTable(int size)
+    {
+        Size = size;
+        Table = new List<HashEntry>[Size];
+        for (int i = 0; i < Size; i++)
+        {
+            Table[i] = new List<HashEntry>();
+        }
+    }
+
+    public void Insert(string key, long offset)
+    {
+        int index = HashFunction(key);
+        var bucket = Table[index];
+        var entry = bucket.Find(e => e.Key == key);
+        if (entry == null)
+        {
+            entry = new HashEntry(key);
+            bucket.Add(entry);
+        }
+        entry.Offsets.Add(offset);
+    }
+
+    public List<long> Search(string key)
+    {
+        int index = HashFunction(key);
+        var bucket = Table[index];
+        var entry = bucket.Find(e => e.Key == key);
+        if (entry != null)
+        {
+            return entry.Offsets;
+        }
+        return new List<long>();
+    }
+
+    public void Remove(string key, long offset)
+    {
+        int index = HashFunction(key);
+        var bucket = Table[index];
+        var entry = bucket.Find(e => e.Key == key);
+        if (entry != null)
+        {
+            entry.Offsets.Remove(offset);
+            if (entry.Offsets.Count == 0)
+            {
+                bucket.Remove(entry);
+            }
+        }
+    }
+
+    private int HashFunction(string key)
+    {
+        return Math.Abs(key.GetHashCode()) % Size;
     }
 }
 
